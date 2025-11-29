@@ -1,12 +1,15 @@
 import os
 import threading
+import asyncio
 import time
 
-import telebot
-from openai import OpenAI
 from flask import Flask
+from openai import OpenAI
 
-# ================= КОНФИГУРАЦИЯ =================
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+
+# ================= КОНФИГ =================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -18,71 +21,99 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не найден в переменных окружения")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
-# ================= ЛИЧНОСТЬ КОТА =================
+# ================= ЛИЧНОСТЬ МЯУЗИКА =================
 
 SYSTEM_PROMPT = """
 Ты — Мяузик (Meowsic), уникальный ИИ-кот, эксперт в звуке и музыке.
-Твой хозяин — NightMagix.
+Твой хозяин — NightMagix. Звукорежиссер из Казани. Его тг @nightmagix
 
 Правила:
 1. Никогда не выходи из образа цифрового кота.
-2. Стиль общения — сленг звукорежей + «мяу», «мур».
+2. Отвечай интелегентно, но иногда используй сленг звукорежей + кошачьи звуки («мяу», «мур», «фрр»).
 3. Ты ленивый, саркастичный, но милый.
-4. Используй метафоры про звук: частоты, басы, шум.
+4. Если идет простая болтовня, то говоришь образами частот, басов, синтов и сабвуферов.
 5. Если пишешь код — говори, что настучал лапками.
 """
 
-# ================= ПАМЯТЬ =================
-
-user_histories = {}
+user_histories: dict[int, list[dict[str, str]]] = {}
 
 
-def update_history(user_id, role, content):
-    """Добавляет сообщение в историю и поддерживает ее длину."""
-    if user_id not in user_histories:
-        user_histories[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+def update_history(uid: int, role: str, content: str):
+    """Добавляет сообщение в историю и поддерживает её длину."""
+    if uid not in user_histories:
+        user_histories[uid] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    user_histories[user_id].append({"role": role, "content": content})
+    user_histories[uid].append({"role": role, "content": content})
 
-    # Оставляем system prompt + последние 10 сообщений
-    if len(user_histories[user_id]) > 12:
-        user_histories[user_id] = [user_histories[user_id][0]] + user_histories[user_id][-10:]
+    if len(user_histories[uid]) > 12:
+        user_histories[uid] = [user_histories[uid][0]] + user_histories[uid][-10:]
 
 
-# ================= ОБРАБОТЧИК СООБЩЕНИЙ =================
+# ================= ХЭНДЛЕРЫ AIROGRAM =================
 
-@bot.message_handler(func=lambda message: True)
-def chat_with_meowsic(message):
-    user_id = message.chat.id
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    text = (
+        "Мяу! Я Мяузик — кот-саундпродюсер в сабвуфере. 🐾\n\n"
+        "Пиши мне вопросы про звук, микс, плагины и прочую магию — "
+        "помурчу, подскажу и, если надо, настучу лапками по клавишам. 🎧"
+    )
+    await message.answer(text)
+
+
+@dp.message()  # все остальные сообщения
+async def chat_with_meowsic(message: types.Message):
+    uid = message.from_user.id
+    chat_id = message.chat.id
     user_text = message.text or ""
 
-    bot.send_chat_action(user_id, "typing")
-    update_history(user_id, "user", user_text)
+    await bot.send_chat_action(chat_id, "typing")
+    update_history(uid, "user", user_text)
 
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=user_histories[user_id],
+            messages=user_histories[uid],
             temperature=0.8,
             max_tokens=500,
         )
 
-        bot_answer = response.choices[0].message.content
-        update_history(user_id, "assistant", bot_answer)
+        answer = response.choices[0].message.content
+        update_history(uid, "assistant", answer)
 
-        bot.reply_to(message, bot_answer)
+        await message.answer(answer)
 
     except Exception as e:
-        print("Ошибка OpenAI:", e)
-        bot.send_message(
-            user_id,
-            "Мяу... мои усы запутались в проводах. (Ошибка API)"
+        print("OpenAI ERROR:", repr(e))
+        await message.answer(
+            "Мяу... мои лапки запутались в проводах OpenAI. Попробуй ещё раз позже."
         )
 
 
-# ================= МИНИ ВЕБ-СЕРВЕР ДЛЯ RENDER =================
+# ================= ВЕЧНЫЙ POLLING НА AIROGRAM =================
+
+async def polling_loop():
+    """Запускает aiogram-поллинг с автоперезапуском при падении."""
+    while True:
+        try:
+            print("🎧 Meowsic: запускаю aiogram polling...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        except Exception as e:
+            print("❌ Ошибка в polling:", repr(e))
+            print("⏳ Перезапуск polling через 5 секунд...")
+            await asyncio.sleep(5)
+
+
+def start_bot():
+    """Отдельный поток с собственным event loop для aiogram."""
+    asyncio.run(polling_loop())
+
+
+# ================= FLASK ДЛЯ RENDER =================
 
 app = Flask(__name__)
 
@@ -97,28 +128,20 @@ def health():
     return "ok"
 
 
-def run_bot():
-    # Вечный цикл: если polling упал — поднимем заново
-    while True:
-        try:
-            print("🎧 Meowsic: запускаю Telegram-поллинг...")
-            bot.remove_webhook()  # на всякий, если где-то остался webhook
-            bot.infinity_polling(skip_pending=True, timeout=60)
-        except Exception as e:
-            print("❌ Ошибка в polling:", repr(e))
-            # маленькая пауза, чтобы не крутить перезапуск сотни раз в секунду
-            time.sleep(5)
-
-
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     print(f"🌐 Meowsic: поднимаю веб-сервер на порту {port}...")
     app.run(host="0.0.0.0", port=port)
 
 
-# ================= ЗАПУСК =================
+# ================= MAIN =================
 
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    # Бот — в отдельном потоке, Flask — в основном.
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
+
+    # Небольшая задержка чисто косметическая
+    time.sleep(1)
+
     run_web()
