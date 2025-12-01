@@ -30,6 +30,24 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# ============== НАСТРОЙКИ АНАЛИЗА ==============
+
+TARGET_SR = 22050                 # рабочий sample rate
+MAX_ANALYSIS_DURATION = 45.0      # макс. длительность для громкости, сек
+MAX_SPECTRUM_DURATION = 15.0      # макс. длительность для спектра, сек
+
+_METERS: Dict[int, pyln.Meter] = {}
+
+
+def get_meter(sr: int) -> pyln.Meter:
+    """Кешируем Meter, чтобы не создавать его каждый раз."""
+    meter = _METERS.get(sr)
+    if meter is None:
+        meter = pyln.Meter(sr)
+        _METERS[sr] = meter
+    return meter
+
+
 # ============== ЛИЧНОСТЬ МЯУЗИКА ==============
 
 SYSTEM_PROMPT = """
@@ -63,7 +81,12 @@ main_keyboard = ReplyKeyboardMarkup(
 
 # ============== АУДИО-АНАЛИТИКА ==============
 
-def load_audio_mono_fast(path: str, target_sr: int = 22050, max_duration: float = 120.0) -> tuple[np.ndarray, int, float]:
+
+def load_audio_mono_fast(
+    path: str,
+    target_sr: int = TARGET_SR,
+    max_duration: float = MAX_ANALYSIS_DURATION,
+) -> tuple[np.ndarray, int, float]:
     """
     Быстрая загрузка: моно, пониженный SR, ограничение по длительности.
     Возвращает (сигнал, sr, длительность_проанализированной_части).
@@ -79,9 +102,10 @@ def analyze_audio(y: np.ndarray, sr: int, duration_sec: float) -> Dict[str, Any]
     """
     Громкость (LUFS, true peak), условный DR и спектр по полосам.
     Анализ идёт по усечённому сигналу (до max_duration).
+    Спектр считаем по ещё более короткому фрагменту для скорости.
     """
     # Loudness
-    meter = pyln.Meter(sr)
+    meter = get_meter(sr)
     loudness = float(meter.integrated_loudness(y))
 
     # True peak
@@ -91,12 +115,15 @@ def analyze_audio(y: np.ndarray, sr: int, duration_sec: float) -> Dict[str, Any]
     # RMS и "динамический диапазон"
     rms_lin = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
     rms_db = 20.0 * np.log10(rms_lin)
-    dr = float(true_peak_db - loudness)  # грубо, но даёт понимание
+    dr = float(true_peak_db - loudness)
 
-    # Спектр (усреднение)
-    spec = np.fft.rfft(y)
+    # Для спектра берём не весь трек, а только первые MAX_SPECTRUM_DURATION секунд
+    max_spec_samples = int(sr * MAX_SPECTRUM_DURATION)
+    y_spec = y[:max_spec_samples] if len(y) > max_spec_samples else y
+
+    spec = np.fft.rfft(y_spec)
     mag = np.abs(spec)
-    freqs = np.fft.rfftfreq(len(y), 1.0 / sr)
+    freqs = np.fft.rfftfreq(len(y_spec), 1.0 / sr)
 
     def band_energy_db(f_lo: float, f_hi: float) -> float:
         idx = np.where((freqs >= f_lo) & (freqs < f_hi))[0]
@@ -139,7 +166,8 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 - RMS: {analysis['rms_db']:.2f} dBFS
 - Оценочный динамический диапазон (DR ≈ TP - LUFS): {analysis['dr']:.2f} dB
 
-Спектральный баланс (примерные средние уровни по полосам, dB):
+Спектральный баланс (примерные средние уровни по полосам, dB)
+(рассчитан по первым ~{min(analysis['duration_sec'], MAX_SPECTRUM_DURATION):.0f} сек трека):
 - Sub (20–60 Hz): {b['sub']:.2f} dB
 - Bass (60–120 Hz): {b['bass']:.2f} dB
 - Low-mid (120–500 Hz): {b['low_mid']:.2f} dB
@@ -151,6 +179,15 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 """
 
 
+def analyze_file_sync(path: str) -> Dict[str, Any]:
+    """
+    Синхронный пайплайн: загрузка -> анализ.
+    Вызывается из отдельного потока, чтобы не блокировать event loop.
+    """
+    y, sr, dur = load_audio_mono_fast(path)
+    return analyze_audio(y, sr, dur)
+
+
 # ============== КОМАНДЫ / КНОПКИ ==============
 
 @dp.message(CommandStart())
@@ -160,6 +197,7 @@ async def cmd_start(message: types.Message):
         "💿 Что я умею сейчас:\n"
         "• Пришлёшь трек — я по цифрам оценю громкость (LUFS), пики, динамику и спектр,\n"
         "  и дам рекомендации, что подкрутить в миксе/мастеринге.\n\n"
+        "Я смотрю только первые ~45 секунд трека, чтобы отвечать быстрее.\n\n"
         "Просто скинь мне аудиофайл (как аудио или документ), или нажми кнопку «Анализ трека»."
     )
     await message.answer(text, reply_markup=main_keyboard)
@@ -168,12 +206,13 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "Анализ трека")
 async def on_analysis_button(message: types.Message):
     await message.answer(
-        "Мур! Отправь мне трек (как аудио или документ), я быстро пробегусь по цифрам:\n"
+        "Мур! Отправь мне трек (как аудио или документ).\n"
+        "Я быстро пробегусь по первым ~45 сек и дам отчёт по:\n"
         "• Loudness (LUFS)\n"
         "• True Peak\n"
-        "• условный DR\n"
-        "• баланс по частотным полосам\n\n"
-        "И выдам тебе понятный отчёт и рекомендации 😺",
+        "• условному DR\n"
+        "• балансу по частотным полосам\n\n"
+        "И выдам понятный отчёт и рекомендации 😺",
         reply_markup=main_keyboard,
     )
 
@@ -200,16 +239,28 @@ async def download_audio_to_temp(message: types.Message) -> str:
 
 @dp.message(F.audio | (F.document & F.document.mime_type.contains("audio")))
 async def on_audio_message(message: types.Message):
-    await message.answer("Мяу, качаю и анализирую твой трек, это займёт немного времени...")
+    await message.answer(
+        "Мяу, качаю и анализирую твой трек.\n"
+        "Смотрю первые ~45 секунд, чтобы ответить побыстрее 🔍🎧"
+    )
 
+    tmp_path = None
     try:
         tmp_path = await download_audio_to_temp(message)
-        y, sr, dur = load_audio_mono_fast(tmp_path)
-        analysis = analyze_audio(y, sr, dur)
+
+        # Тяжёлый анализ — в отдельном потоке
+        analysis = await asyncio.to_thread(analyze_file_sync, tmp_path)
+
     except Exception as e:
         print("Audio processing error:", repr(e))
         await message.answer("Что-то пошло не так при чтении файла. Попробуй другой формат или файл, мяу.")
         return
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     analysis_text = format_analysis_for_llm(analysis)
     prompt = f"""
@@ -238,7 +289,10 @@ async def on_audio_message(message: types.Message):
         await message.answer(answer, reply_markup=main_keyboard)
     except Exception as e:
         print("OpenAI error (analysis):", repr(e))
-        await message.answer("Мур... не смог договориться с OpenAI. Попробуй ещё раз чуть позже.", reply_markup=main_keyboard)
+        await message.answer(
+            "Мур... не смог договориться с OpenAI. Попробуй ещё раз чуть позже.",
+            reply_markup=main_keyboard,
+        )
 
 
 # ============== ОБЫЧНЫЙ ЧАТ ==============
@@ -264,16 +318,21 @@ async def generic_chat(message: types.Message):
         await message.answer(answer, reply_markup=main_keyboard)
     except Exception as e:
         print("OpenAI error (chat):", repr(e))
-        await message.answer("Мяу... у меня лапки, что-то пошло не так с OpenAI. Попробуй ещё раз.", reply_markup=main_keyboard)
+        await message.answer(
+            "Мяу... у меня лапки, что-то пошло не так с OpenAI. Попробуй ещё раз.",
+            reply_markup=main_keyboard,
+        )
 
 
 # ============== FLASK ДЛЯ RENDER ==============
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def index():
     return "Meowsic bot is alive 🐾"
+
 
 @app.route("/health")
 def health():
