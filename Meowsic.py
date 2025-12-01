@@ -3,13 +3,16 @@ import threading
 import asyncio
 import time
 import tempfile
+import subprocess
+import uuid
 from typing import Dict, Any
 
 import numpy as np
 import librosa
 import pyloudnorm as pyln
 
-from flask import Flask
+from flask import Flask, request
+
 from openai import OpenAI
 
 from aiogram import Bot, Dispatcher, types, F
@@ -38,9 +41,18 @@ MAX_SPECTRUM_DURATION = 15.0      # макс. длительность для с
 
 _METERS: Dict[int, pyln.Meter] = {}
 
+# event loop бота для рассылки из Flask-потока
+BOT_LOOP: asyncio.AbstractEventLoop | None = None
+
+# список пользователей, которым можно слать рассылки
+subscribers: set[int] = set()
+
+
+def register_subscriber(chat_id: int):
+    subscribers.add(chat_id)
+
 
 def get_meter(sr: int) -> pyln.Meter:
-    """Кешируем Meter, чтобы не создавать его каждый раз."""
     meter = _METERS.get(sr)
     if meter is None:
         meter = pyln.Meter(sr)
@@ -70,6 +82,23 @@ def update_history(uid: int, role: str, content: str):
         user_histories[uid] = [user_histories[uid][0]] + user_histories[uid][-10:]
 
 
+# ============== РАССЫЛКА ==============
+
+async def broadcast_message(text: str) -> int:
+    count = 0
+    for chat_id in list(subscribers):
+        try:
+            await bot.send_message(
+                chat_id,
+                f"📢 Сообщение от Meowsic:\n\n{text}"
+            )
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print("broadcast error:", chat_id, repr(e))
+    return count
+
+
 # ============== КЛАВИАТУРА ==============
 
 main_keyboard = ReplyKeyboardMarkup(
@@ -82,42 +111,73 @@ main_keyboard = ReplyKeyboardMarkup(
 # ============== АУДИО-АНАЛИТИКА ==============
 
 
+def prepare_audio_with_ffmpeg(src_path: str) -> str:
+    """
+    Через ffmpeg обрезаем до MAX_ANALYSIS_DURATION, приводим к mono 22050.
+    Если ffmpeg недоступен, возвращаем исходный путь.
+    """
+    tmp_dir = tempfile.gettempdir()
+    out_path = os.path.join(tmp_dir, f"meowsic_pre_{uuid.uuid4().hex}.wav")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", src_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", str(TARGET_SR),
+        "-t", str(MAX_ANALYSIS_DURATION),
+        out_path,
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        if os.path.exists(out_path):
+            return out_path
+    except Exception as e:
+        print("ffmpeg error, fallback to original:", repr(e))
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+    return src_path
+
+
 def load_audio_mono_fast(
     path: str,
     target_sr: int = TARGET_SR,
     max_duration: float = MAX_ANALYSIS_DURATION,
 ) -> tuple[np.ndarray, int, float]:
     """
-    Быстрая загрузка: моно, пониженный SR, ограничение по длительности.
-    Возвращает (сигнал, sr, длительность_проанализированной_части).
+    Быстрая загрузка уже подготовленного ffmpeg файла: моно, target_sr.
     """
-    y, sr = librosa.load(path, sr=target_sr, mono=True, duration=max_duration)
+    y, sr = librosa.load(path, sr=target_sr, mono=True)
     if y.size == 0:
         raise RuntimeError("Пустой аудиофайл")
     duration = len(y) / sr
+    if duration > max_duration:
+        samples = int(max_duration * sr)
+        y = y[:samples]
+        duration = max_duration
     return y.astype(np.float32), sr, float(duration)
 
 
 def analyze_audio(y: np.ndarray, sr: int, duration_sec: float) -> Dict[str, Any]:
-    """
-    Громкость (LUFS, true peak), условный DR и спектр по полосам.
-    Анализ идёт по усечённому сигналу (до max_duration).
-    Спектр считаем по ещё более короткому фрагменту для скорости.
-    """
-    # Loudness
     meter = get_meter(sr)
     loudness = float(meter.integrated_loudness(y))
 
-    # True peak
     peak_lin = float(np.max(np.abs(y)) + 1e-12)
     true_peak_db = 20.0 * np.log10(peak_lin)
 
-    # RMS и "динамический диапазон"
     rms_lin = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
     rms_db = 20.0 * np.log10(rms_lin)
     dr = float(true_peak_db - loudness)
 
-    # Для спектра берём не весь трек, а только первые MAX_SPECTRUM_DURATION секунд
     max_spec_samples = int(sr * MAX_SPECTRUM_DURATION)
     y_spec = y[:max_spec_samples] if len(y) > max_spec_samples else y
 
@@ -181,17 +241,26 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 
 def analyze_file_sync(path: str) -> Dict[str, Any]:
     """
-    Синхронный пайплайн: загрузка -> анализ.
-    Вызывается из отдельного потока, чтобы не блокировать event loop.
+    Синхронный пайплайн: ffmpeg-подготовка -> загрузка -> анализ.
+    Вызывается из отдельного потока.
     """
-    y, sr, dur = load_audio_mono_fast(path)
-    return analyze_audio(y, sr, dur)
+    prep_path = prepare_audio_with_ffmpeg(path)
+    try:
+        y, sr, dur = load_audio_mono_fast(prep_path)
+        return analyze_audio(y, sr, dur)
+    finally:
+        if prep_path != path and os.path.exists(prep_path):
+            try:
+                os.remove(prep_path)
+            except OSError:
+                pass
 
 
 # ============== КОМАНДЫ / КНОПКИ ==============
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    register_subscriber(message.chat.id)
     text = (
         "Мяу! Я Мяузик — кот-саундпродюсер.\n\n"
         "💿 Что я умею сейчас:\n"
@@ -205,6 +274,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "Анализ трека")
 async def on_analysis_button(message: types.Message):
+    register_subscriber(message.chat.id)
     await message.answer(
         "Мур! Отправь мне трек (как аудио или документ).\n"
         "Я быстро пробегусь по первым ~45 сек и дам отчёт по:\n"
@@ -239,6 +309,8 @@ async def download_audio_to_temp(message: types.Message) -> str:
 
 @dp.message(F.audio | (F.document & F.document.mime_type.contains("audio")))
 async def on_audio_message(message: types.Message):
+    register_subscriber(message.chat.id)
+
     await message.answer(
         "Мяу, качаю и анализирую твой трек.\n"
         "Смотрю первые ~45 секунд, чтобы ответить побыстрее 🔍🎧"
@@ -247,10 +319,7 @@ async def on_audio_message(message: types.Message):
     tmp_path = None
     try:
         tmp_path = await download_audio_to_temp(message)
-
-        # Тяжёлый анализ — в отдельном потоке
         analysis = await asyncio.to_thread(analyze_file_sync, tmp_path)
-
     except Exception as e:
         print("Audio processing error:", repr(e))
         await message.answer("Что-то пошло не так при чтении файла. Попробуй другой формат или файл, мяу.")
@@ -278,7 +347,7 @@ async def on_audio_message(message: types.Message):
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[
+            messages[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
@@ -302,6 +371,8 @@ async def generic_chat(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
     text = message.text or ""
+
+    register_subscriber(chat_id)
 
     await bot.send_chat_action(chat_id, "typing")
     update_history(uid, "user", text)
@@ -329,9 +400,58 @@ async def generic_chat(message: types.Message):
 app = Flask(__name__)
 
 
-@app.route("/")
+HTML_FORM = """
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Meowsic Broadcast</title>
+  </head>
+  <body>
+    <h2>Meowsic: рассылка сообщений</h2>
+    <form method="post">
+      <div>
+        <label>Пароль:</label><br>
+        <input type="password" name="password">
+      </div>
+      <div style="margin-top:10px;">
+        <label>Сообщение для рассылки:</label><br>
+        <textarea name="message" rows="6" cols="60"></textarea>
+      </div>
+      <div style="margin-top:10px;">
+        <button type="submit">Отправить</button>
+      </div>
+    </form>
+    <p style="color: green;">{status}</p>
+  </body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET", "POST"])
 def index():
-    return "Meowsic bot is alive 🐾"
+    if request.method == "GET":
+        return HTML_FORM.format(status="")
+    password = request.form.get("password", "")
+    text = request.form.get("message", "").strip()
+
+    if password != "12345678":
+        return HTML_FORM.format(status="Неверный пароль.")
+
+    if not text:
+        return HTML_FORM.format(status="Пустое сообщение.")
+
+    global BOT_LOOP
+    if BOT_LOOP is None:
+        return HTML_FORM.format(status="Бот ещё не запущен.")
+
+    try:
+        fut = asyncio.run_coroutine_threadsafe(broadcast_message(text), BOT_LOOP)
+        count = fut.result(timeout=60)
+        return HTML_FORM.format(status=f"Отправлено {count} сообщений.")
+    except Exception as e:
+        print("broadcast exception:", repr(e))
+        return HTML_FORM.format(status="Ошибка при рассылке.")
 
 
 @app.route("/health")
@@ -348,6 +468,8 @@ def start_web():
 # ============== MAIN ==============
 
 async def main():
+    global BOT_LOOP
+    BOT_LOOP = asyncio.get_running_loop()
     print("🎧 Meowsic: запускаю aiogram polling...")
     while True:
         try:
