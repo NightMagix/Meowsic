@@ -22,4 +22,5 @@ COPY . .
 EXPOSE 10000
 
 # Точка входа — твой Bot.py
-CMD ["python", "Bot.py"]
+CMD ["python", "Meowsic.py"]
+
