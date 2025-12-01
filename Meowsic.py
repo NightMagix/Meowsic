@@ -21,7 +21,7 @@ from aiogram.filters import CommandStart, Command
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "models/gemini-1.5-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY не найден в переменных окружения")
@@ -45,7 +45,7 @@ dp = Dispatcher()
 # ===================== ЛИЧНОСТЬ МЯУЗИКА =====================
 
 SYSTEM_PROMPT = """
-Ты — Meowsic, цифровой кот-саундпродюсер.
+Ты — Meowsic, цифровой кот-саундпродюсер. Ты помогаешь людям анализировать треки и даешь советы по звукорежиссуре.
 Говоришь компактно, дружелюбно, местами мяукаешь: "мяу", "мур".
 Делаешь разбор по:
 - громкости: LUFS, true peak, DR;
@@ -198,9 +198,9 @@ async def cmd_start(message: types.Message):
     set_user_model(uid, "gpt")
 
     await message.answer(
-        "Мяу! Я Meowsic — твой кот-саундпродюсер.\n\n"
-        "Пришли мне трек — я быстро разберу его по цифрам: громкость, динамика, спектр.\n"
-        "Используй кнопки внизу.\n\n"
+        "Мяу! Я Meowsic — твой кот-саундпродюсер и персональный помощник.\n\n"
+        "Нужна помощь - просто спрашивай.\n"
+        "Нужна помощь с треком? используй кнопку внизу.\n\n"
         "Команды:\n"
         "• /gpt — использовать GPT\n"
         "• /gemini — использовать Gemini",
@@ -335,3 +335,4 @@ if __name__ == "__main__":
     threading.Thread(target=start_web, daemon=True).start()
     time.sleep(1)
     asyncio.run(main())
+
