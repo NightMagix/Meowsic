@@ -5,3 +5,5 @@ numpy
 soundfile
 librosa
 pyloudnorm
+google-generativeai
+
