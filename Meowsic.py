@@ -97,7 +97,6 @@ def load_audio_mono(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]
     """
     Загружаем аудио как моно сигнал float32.
     """
-    # librosa сам декодирует множество форматов
     y, sr = librosa.load(path, sr=target_sr, mono=True)
     if y.size == 0:
         raise RuntimeError("Пустой аудиофайл")
@@ -108,21 +107,16 @@ def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
     """
     Базовый анализ: LUFS, пики, DR, спектр по полосам и наклон.
     """
-    # Loudness
     meter = pyln.Meter(sr)  # EBU R128
     loudness = float(meter.integrated_loudness(y))
 
-    # True peak (приближенно)
     peak_lin = float(np.max(np.abs(y)) + 1e-12)
     true_peak_db = 20.0 * np.log10(peak_lin)
 
-    # RMS и DR
     rms_lin = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
     rms_db = 20.0 * np.log10(rms_lin)
-    dr = float(true_peak_db - loudness)  # очень грубый показатель динамического диапазона
+    dr = float(true_peak_db - loudness)
 
-    # Спектр
-    # Берем rfft по всему сигналу (для простоты)
     spec = np.fft.rfft(y)
     mag = np.abs(spec)
     freqs = np.fft.rfftfreq(len(y), 1.0 / sr)
@@ -147,7 +141,6 @@ def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
     for name, (f_lo, f_hi) in bands.items():
         band_db[name] = band_energy_db(f_lo, f_hi)
 
-    # общий наклон: разница между "air" и "bass"
     tilt = band_db["air"] - band_db["bass"]
 
     analysis = {
@@ -164,9 +157,6 @@ def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
 
 
 def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
-    """
-    Форматируем результаты анализа в текст для LLM.
-    """
     b = analysis["bands_db"]
     text = f"""
 Технический анализ трека:
@@ -190,12 +180,9 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 
 
 def format_ref_comparison_for_llm(src: Dict[str, Any], ref: Dict[str, Any]) -> str:
-    """
-    Формируем текстовые сравнения исходника и референса.
-    """
     lines = []
 
-    def d(x):  # format
+    def d(x):
         return f"{x:.2f}"
 
     lines.append("Сравнение исходного трека и референса:")
@@ -217,7 +204,6 @@ def format_ref_comparison_for_llm(src: Dict[str, Any], ref: Dict[str, Any]) -> s
         f"разница {d(ref['tilt_db'] - src['tilt_db'])} dB"
     )
 
-    # Рекомендованные цели по громкости:
     loud_diff = ref["loudness_lufs"] - src["loudness_lufs"]
     lines.append("")
     lines.append(
@@ -276,7 +262,7 @@ async def download_audio_to_temp(message: types.Message) -> str:
     """
     if message.audio:
         file_obj = message.audio
-    elif message.document:
+    elif message.document and message.document.mime_type and "audio" in message.document.mime_type:
         file_obj = message.document
     else:
         raise RuntimeError("Нет аудио в сообщении")
@@ -284,7 +270,6 @@ async def download_audio_to_temp(message: types.Message) -> str:
     tmp_dir = tempfile.gettempdir()
     ext = ".ogg"
     if file_obj.file_name and "." in file_obj.file_name:
-        # пытаться сохранить расширение
         ext = "." + file_obj.file_name.split(".")[-1]
 
     tmp_path = os.path.join(tmp_dir, f"meowsic_{file_obj.file_id}{ext}")
@@ -292,17 +277,16 @@ async def download_audio_to_temp(message: types.Message) -> str:
     return tmp_path
 
 
+# Ловим любые аудио / аудио-документы
 @dp.message(F.audio | (F.document & F.document.mime_type.contains("audio")))
 async def on_audio_message(message: types.Message):
     chat_id = message.chat.id
-    uid = message.from_user.id
     mode = get_state(chat_id)
 
-    # Если никакого специального режима нет — просто игнорируем и трактуем как обычный чат
-    if mode is None or mode == "idle":
-        # Пускай просто воспринимается как "непонятный объект" в обычном диалоге
-        await message.reply("Мур, я вижу аудиофайл, но сейчас не в режиме анализа. Нажми «Анализ трека» или «Автомастеринг под референс».")
-        return
+    # Если режим не задан, трактуем как простой анализ по умолчанию
+    effective_mode = mode
+    if effective_mode is None or effective_mode == "idle":
+        effective_mode = "analysis_wait_track"
 
     await message.answer("Мяу, качаю и анализирую твой файл, подожди немного...")
 
@@ -316,8 +300,7 @@ async def on_audio_message(message: types.Message):
         return
 
     # ==== Режим простой аналитики ====
-    if mode == "analysis_wait_track":
-        # Сброс в idle
+    if effective_mode == "analysis_wait_track":
         set_state(chat_id, "idle")
 
         analysis_text = format_analysis_for_llm(analysis)
@@ -352,7 +335,7 @@ async def on_audio_message(message: types.Message):
         return
 
     # ==== Режим автомастеринга: сначала исходник ====
-    if mode == "refmaster_wait_source":
+    if effective_mode == "refmaster_wait_source":
         ref_sessions[chat_id] = {
             "source_path": tmp_path,
             "source_analysis": analysis,
@@ -365,7 +348,7 @@ async def on_audio_message(message: types.Message):
         return
 
     # ==== Режим автомастеринга: референс ====
-    if mode == "refmaster_wait_ref":
+    if effective_mode == "refmaster_wait_ref":
         session = ref_sessions.get(chat_id)
         if not session:
             await message.answer("Я потерял контекст. Мяу... Начни заново с кнопки «Автомастеринг под референс».")
@@ -373,13 +356,11 @@ async def on_audio_message(message: types.Message):
             return
 
         source_analysis = session["source_analysis"]
-        ref_analysis = analysis  # текущий — референс
+        ref_analysis = analysis
 
-        # Сброс состояния
         set_state(chat_id, "idle")
         ref_sessions.pop(chat_id, None)
 
-        # Формируем сравнение
         compare_text = format_ref_comparison_for_llm(source_analysis, ref_analysis)
         prompt = f"""
 Пользователь хочет автомастеринг исходного трека под референс.
@@ -399,7 +380,7 @@ async def on_audio_message(message: types.Message):
 2) Напиши, на сколько dB примерно нужно изменить громкость исходника (гейн) относительно текущего состояния.
 3) Дай рекомендации по эквализации по полосам (sub, bass, low-mid, mid, high-mid, air): где приподнять/приглушить и на сколько dB (ориентировочно).
 4) Дай рекомендации по динамике: сколько примерно дБ GR на мастеринговом компрессоре, нужна ли мультибэнд-компрессия, насколько агрессивный лимитер.
-5) Если есть риски перегруза в сабе, грязи в мид, резкости в high-mid — укажи их.
+5) Если есть риски перегруза в сабе, грязи в mid, резкости в high-mid — укажи их.
 6) Дай краткий “cheat sheet” — список шагов для мастеринговой цепочки (EQ → Comp → Limiter → Saturation и т.п.).
 7) Пиши в образе Meowsic (кот-саундпродюсер), с лёгким юмором, но профессионально.
 """
@@ -422,7 +403,7 @@ async def on_audio_message(message: types.Message):
         return
 
 
-# ================= ОБЫЧНЫЙ ЧАТ, ЕСЛИ НЕ В РЕЖИМАХ =================
+# ================= ОБЫЧНЫЙ ЧАТ =================
 
 @dp.message()
 async def generic_chat(message: types.Message):
@@ -431,7 +412,6 @@ async def generic_chat(message: types.Message):
     text = message.text or ""
 
     mode = get_state(chat_id)
-    # если пользователь в специальном режиме, а пишет текст вместо аудио — подскажем
     if mode == "analysis_wait_track":
         await message.answer("Мяу, сейчас я жду от тебя аудиофайл для анализа. Пришли трек как аудио или документ.")
         return
@@ -442,7 +422,6 @@ async def generic_chat(message: types.Message):
         await message.answer("Теперь пришли РЕФЕРЕНСНЫЙ трек (тот, под который выравниваем).")
         return
 
-    # Обычный диалог с котом
     await bot.send_chat_action(chat_id, "typing")
     update_history(uid, "user", text)
 
@@ -498,11 +477,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Flask — в отдельном потоке, чтобы Render считал, что это веб-сервис
     web_thread = threading.Thread(target=start_web, daemon=True)
     web_thread.start()
-
     time.sleep(1)
-
-    # aiogram — в главном потоке
     asyncio.run(main())
