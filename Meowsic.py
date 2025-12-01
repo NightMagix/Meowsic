@@ -405,15 +405,16 @@ async def cmd_normal(message: types.Message):
 async def on_analysis_button(message: types.Message):
     register_subscriber(message.chat.id)
     await message.answer(
-        "Мур! Отправь мне трек (как аудио или документ).\n"
-        Процесс анализа может занять время. Потерпи и я дам отчёт по:\n"
-        "• Loudness (LUFS)\n"
-        "• True Peak\n"
-        "• условному DR (динам диапазон)\n"
-        "• балансу по частотным полосам\n\n"
-        "И выдам понятный отчёт и рекомендации.",
-        reply_markup=main_keyboard,
-    )
+    """Мур! Отправь мне трек (как аудио или документ).
+Процесс анализа может занять время. Потерпи и я дам отчёт по:
+- Loudness (LUFS)
+- True Peak
+- условному DR (динамический диапазон)
+- балансу по частотным полосам
+
+И выдам понятный отчёт и рекомендации.""",
+    reply_markup=main_keyboard,
+)
 
 
 # ============== ЗАГРУЗКА АУДИО И АНАЛИЗ ==============
@@ -672,6 +673,7 @@ if __name__ == "__main__":
     web_thread.start()
     time.sleep(1)
     asyncio.run(main())
+
 
 
 
