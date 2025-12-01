@@ -42,25 +42,22 @@ else:
 
 # ============== НАСТРОЙКИ АНАЛИЗА ==============
 
-TARGET_SR = 22050                 # рабочий sample rate
-MAX_ANALYSIS_DURATION = 45.0      # макс. длительность для громкости, сек
-MAX_SPECTRUM_DURATION = 15.0      # макс. длительность для спектра, сек
+TARGET_SR = 22050
+MAX_ANALYSIS_DURATION = 45.0
+MAX_SPECTRUM_DURATION = 15.0
 
 _METERS: Dict[int, pyln.Meter] = {}
 
-# event loop бота для рассылки из Flask-потока
 BOT_LOOP: asyncio.AbstractEventLoop | None = None
-
-# список пользователей, которым можно слать рассылки
 subscribers: set[int] = set()
 
-# режимы: "gpt" или "gemini"
+# режимы моделей: "gpt" или "gemini"
 user_modes: Dict[int, str] = {}
+# персоны: "cat" или "normal"
+user_personas: Dict[int, str] = {}
 
-# истории чата для GPT
+# истории чата
 gpt_histories: Dict[int, list] = {}
-
-# чаты для Gemini
 gemini_chats: Dict[int, Any] = {}
 
 
@@ -77,26 +74,31 @@ def get_meter(sr: int) -> pyln.Meter:
 
 
 def clean_markdown(text: str) -> str:
-    """
-    Убираем **жирный**, *курсив*, `код` и __подчёркивание__, чтобы в Телеге не было звёздочек.
-    """
+    # убираем **, *, `, __ чтобы в телеге не было звёздочек
     for mark in ("**", "*", "`", "__"):
         text = text.replace(mark, "")
     return text
 
 
-# ============== ЛИЧНОСТЬ МЯУЗИКА ==============
+# ============== ПЕРСОНЫ ==============
 
-SYSTEM_PROMPT = """
+CAT_SYSTEM_PROMPT = """
 Ты — Мяузик (Meowsic), цифровой кот-саундпродюсер.
 Ты эксперт по звуку, миксу и мастерингу и даёшь рекомендации по цифрам: LUFS, пиковый уровень, динамический диапазон, спектр по полосам.
 Всегда опирайся только на переданные параметры анализа, не придумывай, что ты "слышишь" трек.
-Говоришь как обычный человек. Объясняй простым языком, но технически точно. Когда уместно, можно мяукать: "мяу", "мур", "фрр".
+Объясняй простым языком, но технически точно. Иногда можно мяукать: "мяу", "мур", "фрр".
 """
 
-CHAT_PERSONA = """
+NORMAL_SYSTEM_PROMPT = """
+Ты — профессиональный звукоинженер и мастеринг-инженер.
+Ты анализируешь цифры анализа трека: LUFS, пики, динамический диапазон, спектр по полосам.
+Всегда опирайся только на переданные параметры анализа, не придумывай, что ты реально слышишь звук.
+Объясняй простым языком, но технически точно. Без котов, без "мяу" и прочих персонажей.
+"""
+
+CAT_CHAT_PERSONA = """
 Ты — Мяузик (Meowsic), дружелюбный кот-саундпродюсер и помощник по звуку и творчеству.
-Говоришь как обычный человек. Отвечай по делу, но простым языком. Можно немного шутить и иногда вставлять "мяу"/"мур", но только когда это уместно.
+Отвечай по делу, но простым языком. Можно немного шутить и иногда вставлять "мяу"/"мур", но без перегиба.
 Если задают не звуковой вопрос — всё равно отвечай, как нормальный умный кот.
 
 Важно: если пользователь спрашивает, какая ты модель, отвечай честно:
@@ -104,14 +106,40 @@ CHAT_PERSONA = """
 - в режиме Gemini: что ты Gemini 2.5 Flash от Google.
 """
 
+NORMAL_CHAT_PERSONA = """
+Ты — умный помощник-ИИ и профессиональный звукоинженер.
+Отвечай по делу, без котиков и "мяу", спокойно и понятно.
+Если задают не звуковой вопрос — отвечай как обычный универсальный ИИ.
+
+Важно: если пользователь спрашивает, какая ты модель, отвечай честно:
+- в режиме GPT: что ты gpt-4.1-mini от OpenAI;
+- в режиме Gemini: что ты Gemini 2.5 Flash от Google.
+"""
+
+
+def get_persona(uid: int) -> str:
+    return user_personas.get(uid, "cat")
+
+
+def get_chat_persona(uid: int) -> str:
+    return CAT_CHAT_PERSONA if get_persona(uid) == "cat" else NORMAL_CHAT_PERSONA
+
+
+def get_analysis_system_prompt(uid: int) -> str:
+    return CAT_SYSTEM_PROMPT if get_persona(uid) == "cat" else NORMAL_SYSTEM_PROMPT
+
 
 # ============== GPT ИСТОРИЯ ==============
 
-def update_gpt_history(uid: int, role: str, content: str):
+def ensure_gpt_history(uid: int):
     if uid not in gpt_histories:
         gpt_histories[uid] = [
-            {"role": "system", "content": CHAT_PERSONA}
+            {"role": "system", "content": get_chat_persona(uid)}
         ]
+
+
+def update_gpt_history(uid: int, role: str, content: str):
+    ensure_gpt_history(uid)
     gpt_histories[uid].append({"role": role, "content": content})
     if len(gpt_histories[uid]) > 14:
         gpt_histories[uid] = [gpt_histories[uid][0]] + gpt_histories[uid][-12:]
@@ -123,7 +151,7 @@ def get_gemini_chat(uid: int):
     if uid in gemini_chats:
         return gemini_chats[uid]
     model = genai.GenerativeModel("models/gemini-2.5-flash")
-    persona = CHAT_PERSONA + """
+    persona = get_chat_persona(uid) + """
 Сейчас ты запущен через Google Gemini, модель models/gemini-2.5-flash.
 Если пользователь спрашивает, какая ты модель, честно отвечай, что ты Gemini 2.5 Flash от Google.
 Никогда не называй себя GPT и не говори, что работаешь на архитектуре GPT-4.
@@ -166,10 +194,6 @@ main_keyboard = ReplyKeyboardMarkup(
 # ============== АУДИО-АНАЛИТИКА ==============
 
 def prepare_audio_with_ffmpeg(src_path: str) -> str:
-    """
-    Через ffmpeg обрезаем до MAX_ANALYSIS_DURATION, приводим к mono 22050.
-    Если ffmpeg недоступен, возвращаем исходный путь.
-    """
     tmp_dir = tempfile.gettempdir()
     out_path = os.path.join(tmp_dir, f"meowsic_pre_{uuid.uuid4().hex}.wav")
 
@@ -207,9 +231,6 @@ def load_audio_mono_fast(
     target_sr: int = TARGET_SR,
     max_duration: float = MAX_ANALYSIS_DURATION,
 ) -> tuple[np.ndarray, int, float]:
-    """
-    Быстрая загрузка уже подготовленного ffmpeg файла: моно, target_sr.
-    """
     y, sr = librosa.load(path, sr=target_sr, mono=True)
     if y.size == 0:
         raise RuntimeError("Пустой аудиофайл")
@@ -294,10 +315,6 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 
 
 def analyze_file_sync(path: str) -> Dict[str, Any]:
-    """
-    Синхронный пайплайн: ffmpeg-подготовка -> загрузка -> анализ.
-    Вызывается из отдельного потока.
-    """
     prep_path = prepare_audio_with_ffmpeg(path)
     try:
         y, sr, dur = load_audio_mono_fast(prep_path)
@@ -310,7 +327,7 @@ def analyze_file_sync(path: str) -> Dict[str, Any]:
                 pass
 
 
-# ============== КОМАНДЫ / КНОПКИ ==============
+# ============== КОМАНДЫ / МОДЕЛИ И ПЕРСОНЫ ==============
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -319,17 +336,23 @@ async def cmd_start(message: types.Message):
 
     register_subscriber(chat_id)
     user_modes[uid] = "gpt"
+    user_personas[uid] = "cat"
+    gpt_histories.pop(uid, None)
+    gemini_chats.pop(uid, None)
 
     text = (
-        "Мяу! Я Мяузик — кот-саундпродюсер.\n\n"
+        "Мяу! Я Мяузик — кот-саундпродюсер и твой личный помощник.\n\n"
         "💿 Что я умею сейчас:\n"
         "• Анализировать треки по LUFS, пикам, динамике и спектру.\n"
         "• Общаться в режиме чата.\n\n"
-        "Команды:\n"
-        "• /gpt — чат через ChatGPT\n"
-        "• /gemini — чат через Gemini\n\n"
-        "Если возникают проблемы - пиши разработчику @Nightmagix\n"
-        "Для начала, просто скинь трек или напиши мне что-нибудь."
+        "Команды моделей:\n"
+        "• /gpt — использовать ChatGPT\n"
+        "• /gemini — использовать Gemini\n\n"
+        "Команды персоны:\n"
+        "• /cat — музыкальный кот Meowsic\n"
+        "• /normal — обычный ИИ без котиков\n\n"
+        "По умолчанию: GPT + кот.\n"
+        "Если что-то не работает или работает неправильно - пиши моему хозяину @nightmagix."
     )
     await message.answer(text, reply_markup=main_keyboard)
 
@@ -339,7 +362,7 @@ async def cmd_gpt(message: types.Message):
     uid = message.from_user.id
     register_subscriber(message.chat.id)
     user_modes[uid] = "gpt"
-    await message.answer("Мяу! Теперь я отвечаю и анализирую треки через ChatGPT.", reply_markup=main_keyboard)
+    await message.answer("Мяу! Теперь я отвечаю и анализирую треки через ChatGPT (gpt-4.1-mini).", reply_markup=main_keyboard)
 
 
 @dp.message(Command("gemini"))
@@ -355,7 +378,27 @@ async def cmd_gemini(message: types.Message):
         return
 
     user_modes[uid] = "gemini"
-    await message.answer("Мур! Теперь я отвечаю и анализирую треки через Gemini.", reply_markup=main_keyboard)
+    await message.answer("Мур! Теперь я отвечаю и анализирую треки через Gemini (models/gemini-2.5-flash).", reply_markup=main_keyboard)
+
+
+@dp.message(Command("cat"))
+async def cmd_cat(message: types.Message):
+    uid = message.from_user.id
+    register_subscriber(message.chat.id)
+    user_personas[uid] = "cat"
+    gpt_histories.pop(uid, None)
+    gemini_chats.pop(uid, None)
+    await message.answer("Мур! Включён режим музыкального кота Meowsic.", reply_markup=main_keyboard)
+
+
+@dp.message(Command("normal"))
+async def cmd_normal(message: types.Message):
+    uid = message.from_user.id
+    register_subscriber(message.chat.id)
+    user_personas[uid] = "normal"
+    gpt_histories.pop(uid, None)
+    gemini_chats.pop(uid, None)
+    await message.answer("Ок. Включён режим обычного ИИ без котиков и 'мяу'.", reply_markup=main_keyboard)
 
 
 @dp.message(F.text == "Анализ трека")
@@ -363,12 +406,12 @@ async def on_analysis_button(message: types.Message):
     register_subscriber(message.chat.id)
     await message.answer(
         "Мур! Отправь мне трек (как аудио или документ).\n"
-        "Я быстро пробегусь по первым ~45 сек и дам отчёт по:\n"
+        Процесс анализа может занять время. Потерпи и я дам отчёт по:\n"
         "• Loudness (LUFS)\n"
         "• True Peak\n"
-        "• условному DR\n"
+        "• условному DR (динам диапазон)\n"
         "• балансу по частотным полосам\n\n"
-        "И выдам понятный отчёт и рекомендации 😺",
+        "И выдам понятный отчёт и рекомендации.",
         reply_markup=main_keyboard,
     )
 
@@ -398,6 +441,8 @@ async def on_audio_message(message: types.Message):
     register_subscriber(message.chat.id)
     uid = message.from_user.id
     mode = user_modes.get(uid, "gpt")
+    persona = get_persona(uid)
+
     if mode == "gemini" and not GEMINI_API_KEY:
         mode = "gpt"
 
@@ -423,7 +468,11 @@ async def on_audio_message(message: types.Message):
 
     analysis_text = format_analysis_for_llm(analysis)
 
-    # ----- общий текст задания для модели -----
+    if persona == "cat":
+        style_line = "Пиши в образе Meowsic — кот-саундпродюсер, немного с юмором, но без воды."
+    else:
+        style_line = "Пиши как профессиональный звукоинженер, без котиков и 'мяу', коротко и по делу."
+
     base_prompt = f"""
 Пользователь прислал трек на анализ. Вот технические параметры (громкость, пики, динамика и спектр):
 
@@ -433,17 +482,17 @@ async def on_audio_message(message: types.Message):
 1) Оцени громкость (LUFS, true peak, DR): тихо/норм/очень громко. Подходит ли под стриминги? под клуб?
 2) Оцени спектр: низ, низ-середина, середина, верхняя середина, воздух. Где перебор, где нехватка.
 3) Дай 5–10 конкретных рекомендаций по эквализации, компрессии и лимитеру.
-4) Пиши в образе Meowsic — кот-саундпродюсер, немного с юмором, но без воды.
+4) {style_line}
 Ответ сделай компактным, чтобы его было удобно читать с телефона.
 """
 
     try:
-        # ----- анализ через GPT -----
         if mode == "gpt":
+            system_prompt = get_analysis_system_prompt(uid)
             response = client.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": base_prompt},
                 ],
                 temperature=0.6,
@@ -451,20 +500,16 @@ async def on_audio_message(message: types.Message):
             )
             answer = response.choices[0].message.content or ""
             answer = clean_markdown(answer)
-            answer = "🤖 [GPT] " + answer
+            answer = "🤖" + answer
             await message.answer(answer, reply_markup=main_keyboard)
-        # ----- анализ через Gemini -----
         else:
-            model = genai.GenerativeModel("models/gemini-2.5-flash")
-            persona = SYSTEM_PROMPT + """
-Сейчас ты запущен через Google Gemini, модель models/gemini-2.5-flash.
-Отвечай строго по цифрам анализа, не придумывай, что ты реально слышишь звук.
-"""
-            full_prompt = persona + "\n\n" + base_prompt
-            response = model.generate_content(full_prompt)
+            system_prompt = get_analysis_system_prompt(uid)
+            model_llm = genai.GenerativeModel("models/gemini-2.5-flash")
+            full_prompt = system_prompt + "\n\n" + base_prompt
+            response = model_llm.generate_content(full_prompt)
             answer = response.text or ""
             answer = clean_markdown(answer)
-            answer = "🌀 [Gemini] " + answer
+            answer = "🌀" + answer
             await message.answer(answer, reply_markup=main_keyboard)
 
     except Exception as e:
@@ -488,7 +533,6 @@ async def generic_chat(message: types.Message):
 
     await bot.send_chat_action(chat_id, "typing")
 
-    # ----- GPT режим -----
     if mode == "gpt":
         update_gpt_history(uid, "user", text)
         try:
@@ -501,7 +545,7 @@ async def generic_chat(message: types.Message):
             answer = response.choices[0].message.content or ""
             update_gpt_history(uid, "assistant", answer)
             answer = clean_markdown(answer)
-            answer = "🤖 [GPT] " + answer
+            answer = "🤖" + answer
             await message.answer(answer, reply_markup=main_keyboard)
         except Exception as e:
             print("OpenAI error (chat):", repr(e))
@@ -511,7 +555,6 @@ async def generic_chat(message: types.Message):
             )
         return
 
-    # ----- GEMINI режим -----
     if mode == "gemini":
         if not GEMINI_API_KEY:
             await message.answer(
@@ -524,7 +567,7 @@ async def generic_chat(message: types.Message):
             response = chat.send_message(text)
             answer = response.text or ""
             answer = clean_markdown(answer)
-            answer = "🌀 [Gemini] " + answer
+            answer = "🌀" + answer
             await message.answer(answer, reply_markup=main_keyboard)
         except Exception as e:
             print("Gemini error (chat):", repr(e))
@@ -629,5 +672,6 @@ if __name__ == "__main__":
     web_thread.start()
     time.sleep(1)
     asyncio.run(main())
+
 
 
