@@ -91,12 +91,12 @@ SYSTEM_PROMPT = """
 Ты — Мяузик (Meowsic), цифровой кот-саундпродюсер.
 Ты эксперт по звуку, миксу и мастерингу и даёшь рекомендации по цифрам: LUFS, пиковый уровень, динамический диапазон, спектр по полосам.
 Всегда опирайся только на переданные параметры анализа, не придумывай, что ты "слышишь" трек.
-Объясняй простым языком, но технически точно. Иногда можно мяукать: "мяу", "мур", "фрр".
+Говоришь как обычный человек. Объясняй простым языком, но технически точно. Когда уместно, можно мяукать: "мяу", "мур", "фрр".
 """
 
 CHAT_PERSONA = """
 Ты — Мяузик (Meowsic), дружелюбный кот-саундпродюсер и помощник по звуку и творчеству.
-Отвечай по делу, но простым языком. Можно немного шутить и иногда вставлять "мяу"/"мур", но без перегиба.
+Говоришь как обычный человек. Отвечай по делу, но простым языком. Можно немного шутить и иногда вставлять "мяу"/"мур", но только когда это уместно.
 Если задают не звуковой вопрос — всё равно отвечай, как нормальный умный кот.
 
 Важно: если пользователь спрашивает, какая ты модель, отвечай честно:
@@ -327,9 +327,9 @@ async def cmd_start(message: types.Message):
         "• Общаться в режиме чата.\n\n"
         "Команды:\n"
         "• /gpt — чат через ChatGPT\n"
-        "• /gemini — чат через Gemini (models/gemini-2.5-flash)\n\n"
-        "По умолчанию включен режим GPT.\n"
-        "Просто скинь трек или напиши мне что-нибудь."
+        "• /gemini — чат через Gemini\n\n"
+        "Если возникают проблемы - пиши разработчику @Nnightmagix\n"
+        "Для началаПросто скинь трек или напиши мне что-нибудь."
     )
     await message.answer(text, reply_markup=main_keyboard)
 
@@ -339,7 +339,7 @@ async def cmd_gpt(message: types.Message):
     uid = message.from_user.id
     register_subscriber(message.chat.id)
     user_modes[uid] = "gpt"
-    await message.answer("Мяу! Теперь я отвечаю и анализирую треки через ChatGPT (gpt-4.1-mini).", reply_markup=main_keyboard)
+    await message.answer("Мяу! Теперь я отвечаю и анализирую треки через ChatGPT.", reply_markup=main_keyboard)
 
 
 @dp.message(Command("gemini"))
@@ -355,7 +355,7 @@ async def cmd_gemini(message: types.Message):
         return
 
     user_modes[uid] = "gemini"
-    await message.answer("Мур! Теперь я отвечаю и анализирую треки через Gemini (models/gemini-2.5-flash).", reply_markup=main_keyboard)
+    await message.answer("Мур! Теперь я отвечаю и анализирую треки через Gemini.", reply_markup=main_keyboard)
 
 
 @dp.message(F.text == "Анализ трека")
@@ -629,3 +629,4 @@ if __name__ == "__main__":
     web_thread.start()
     time.sleep(1)
     asyncio.run(main())
+
