@@ -7,7 +7,6 @@ import tempfile
 from typing import Dict, Any, Optional
 
 import numpy as np
-import soundfile as sf
 import librosa
 import pyloudnorm as pyln
 
@@ -52,7 +51,6 @@ SYSTEM_PROMPT = """
 user_histories: Dict[int, list] = {}
 
 def update_history(uid: int, role: str, content: str):
-    """Обновляем историю диалога для текстового общения."""
     if uid not in user_histories:
         user_histories[uid] = [{"role": "system", "content": SYSTEM_PROMPT}]
     user_histories[uid].append({"role": role, "content": content})
@@ -63,18 +61,15 @@ def update_history(uid: int, role: str, content: str):
 # ================= СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЯ =================
 
 # mode:
-#   None / "idle" — обычный чат с котом
+#   None / "idle" — обычный чат
 #   "analysis_wait_track" — ждём трек для анализа
 #   "refmaster_wait_source" — ждём исходный трек
-#   "refmaster_wait_ref" — ждём референсный трек
+#   "refmaster_wait_ref" — ждём референс
 user_state: Dict[int, Dict[str, Any]] = {}
-
-# Для автомастеринга под референс храним временно анализ исходника
 ref_sessions: Dict[int, Dict[str, Any]] = {}
 
 def set_state(chat_id: int, mode: Optional[str]):
     user_state[chat_id] = {"mode": mode}
-
 
 def get_state(chat_id: int) -> Optional[str]:
     return user_state.get(chat_id, {}).get("mode")
@@ -94,9 +89,6 @@ main_keyboard = ReplyKeyboardMarkup(
 # ================= АУДИО-АНАЛИТИКА =================
 
 def load_audio_mono(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
-    """
-    Загружаем аудио как моно сигнал float32.
-    """
     y, sr = librosa.load(path, sr=target_sr, mono=True)
     if y.size == 0:
         raise RuntimeError("Пустой аудиофайл")
@@ -104,10 +96,7 @@ def load_audio_mono(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]
 
 
 def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
-    """
-    Базовый анализ: LUFS, пики, DR, спектр по полосам и наклон.
-    """
-    meter = pyln.Meter(sr)  # EBU R128
+    meter = pyln.Meter(sr)
     loudness = float(meter.integrated_loudness(y))
 
     peak_lin = float(np.max(np.abs(y)) + 1e-12)
@@ -137,13 +126,10 @@ def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
         "air": (8000, 20000),
     }
 
-    band_db = {}
-    for name, (f_lo, f_hi) in bands.items():
-        band_db[name] = band_energy_db(f_lo, f_hi)
-
+    band_db = {name: band_energy_db(*rng) for name, rng in bands.items()}
     tilt = band_db["air"] - band_db["bass"]
 
-    analysis = {
+    return {
         "loudness_lufs": loudness,
         "true_peak_db": true_peak_db,
         "rms_db": rms_db,
@@ -153,12 +139,11 @@ def analyze_audio(y: np.ndarray, sr: int) -> Dict[str, Any]:
         "duration_sec": float(len(y) / sr),
         "sr": sr,
     }
-    return analysis
 
 
 def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
     b = analysis["bands_db"]
-    text = f"""
+    return f"""
 Технический анализ трека:
 - Длительность: {analysis['duration_sec']:.1f} сек
 - Loudness (integrated LUFS): {analysis['loudness_lufs']:.2f} LUFS
@@ -176,45 +161,33 @@ def format_analysis_for_llm(analysis: Dict[str, Any]) -> str:
 
 Общий спектральный наклон (Air - Bass): {analysis['tilt_db']:.2f} dB
 """
-    return text
 
 
 def format_ref_comparison_for_llm(src: Dict[str, Any], ref: Dict[str, Any]) -> str:
+    def d(x): return f"{x:.2f}"
     lines = []
-
-    def d(x):
-        return f"{x:.2f}"
-
-    lines.append("Сравнение исходного трека и референса:")
-    lines.append("")
+    lines.append("Сравнение исходного трека и референса:\n")
     lines.append(f"- Исходник: {d(src['loudness_lufs'])} LUFS, true peak {d(src['true_peak_db'])} dBFS, DR ≈ {d(src['dr'])}")
-    lines.append(f"- Референс: {d(ref['loudness_lufs'])} LUFS, true peak {d(ref['true_peak_db'])} dBFS, DR ≈ {d(ref['dr'])}")
-    lines.append("")
+    lines.append(f"- Референс: {d(ref['loudness_lufs'])} LUFS, true peak {d(ref['true_peak_db'])} dBFS, DR ≈ {d(ref['dr'])}\n")
     lines.append("Спектральный баланс по основным полосам (dB):")
-
     for band in ["sub", "bass", "low_mid", "mid", "high_mid", "air"]:
         lines.append(
             f"- {band}: исходник {d(src['bands_db'][band])}, референс {d(ref['bands_db'][band])}, "
             f"разница (ref - src) = {d(ref['bands_db'][band] - src['bands_db'][band])} dB"
         )
-
-    lines.append("")
     lines.append(
-        f"Наклон спектра (Air-Bass): исходник {d(src['tilt_db'])} dB, референс {d(ref['tilt_db'])} dB, "
+        f"\nНаклон спектра (Air-Bass): исходник {d(src['tilt_db'])} dB, референс {d(ref['tilt_db'])} dB, "
         f"разница {d(ref['tilt_db'] - src['tilt_db'])} dB"
     )
-
     loud_diff = ref["loudness_lufs"] - src["loudness_lufs"]
-    lines.append("")
     lines.append(
-        f"Чтобы привести громкость исходника к уровню референса, "
-        f"нужно примерно изменить уровень на {d(loud_diff)} dB (ref - src)."
+        f"\nЧтобы привести громкость исходника к уровню референса, нужно примерно изменить уровень "
+        f"на {d(loud_diff)} dB (ref - src)."
     )
-
     return "\n".join(lines)
 
 
-# ================= ХЭНДЛЕРЫ КОМАНД / КНОПОК =================
+# ================= КОМАНДЫ / КНОПКИ =================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -226,7 +199,7 @@ async def cmd_start(message: types.Message):
         "• общаться как обычный ИИ-кот по звуку и не только;\n"
         "• анализировать твои треки по громкости, динамике и спектру;\n"
         "• делать подробное ТЗ для автомастеринга под референс.\n\n"
-        "Выбери режим на клавиатуре внизу, или просто пиши мне вопросы 😺"
+        "Выбери режим на клавиатуре внизу, или просто скинь мне трек — я его сам проанализирую 😺"
     )
     await message.answer(text, reply_markup=main_keyboard)
 
@@ -254,12 +227,9 @@ async def on_refmaster_button(message: types.Message):
     )
 
 
-# ================= ЗАГРУЗКА АУДИО И ОБРАБОТКА =================
+# ================= ЗАГРУЗКА АУДИО =================
 
 async def download_audio_to_temp(message: types.Message) -> str:
-    """
-    Скачиваем audio или документ с аудио во временный файл и возвращаем путь.
-    """
     if message.audio:
         file_obj = message.audio
     elif message.document and message.document.mime_type and "audio" in message.document.mime_type:
@@ -277,13 +247,13 @@ async def download_audio_to_temp(message: types.Message) -> str:
     return tmp_path
 
 
-# Ловим любые аудио / аудио-документы
+# Ловим любые аудио/аудио-документы
 @dp.message(F.audio | (F.document & F.document.mime_type.contains("audio")))
 async def on_audio_message(message: types.Message):
     chat_id = message.chat.id
     mode = get_state(chat_id)
 
-    # Если режим не задан, трактуем как простой анализ по умолчанию
+    # Если режим не задан, по умолчанию делаем обычный анализ
     effective_mode = mode
     if effective_mode is None or effective_mode == "idle":
         effective_mode = "analysis_wait_track"
@@ -296,13 +266,12 @@ async def on_audio_message(message: types.Message):
         analysis = analyze_audio(y, sr)
     except Exception as e:
         print("Audio processing error:", repr(e))
-        await message.answer("Что-то пошло не так при чтении файла. Мяу... Попробуй другой формат или файл.")
+        await message.answer("Что-то пошло не так при чтении файла. Попробуй другой формат или файл, мяу.")
         return
 
-    # ==== Режим простой аналитики ====
+    # === Обычный анализ ===
     if effective_mode == "analysis_wait_track":
         set_state(chat_id, "idle")
-
         analysis_text = format_analysis_for_llm(analysis)
         prompt = f"""
 Пользователь прислал трек на анализ. Вот технические параметры:
@@ -330,11 +299,10 @@ async def on_audio_message(message: types.Message):
             await message.answer(answer)
         except Exception as e:
             print("OpenAI error (analysis):", repr(e))
-            await message.answer("Мяу... у меня лапки, не смог договориться с OpenAI. Попробуй ещё раз позже.")
-
+            await message.answer("Мяу... не смог договориться с OpenAI. Попробуй ещё раз позже.")
         return
 
-    # ==== Режим автомастеринга: сначала исходник ====
+    # === Автомастеринг: сначала исходник ===
     if effective_mode == "refmaster_wait_source":
         ref_sessions[chat_id] = {
             "source_path": tmp_path,
@@ -347,11 +315,11 @@ async def on_audio_message(message: types.Message):
         )
         return
 
-    # ==== Режим автомастеринга: референс ====
+    # === Автомастеринг: референс ===
     if effective_mode == "refmaster_wait_ref":
         session = ref_sessions.get(chat_id)
         if not session:
-            await message.answer("Я потерял контекст. Мяу... Начни заново с кнопки «Автомастеринг под референс».")
+            await message.answer("Я потерял контекст. Мяу... Начни заново с «Автомастеринг под референс».")
             set_state(chat_id, "idle")
             return
 
@@ -377,12 +345,12 @@ async def on_audio_message(message: types.Message):
 Сделай детальный план автомастеринга исходника под референс.
 Важно:
 1) Опиши целевой уровень громкости (LUFS) и true peak.
-2) Напиши, на сколько dB примерно нужно изменить громкость исходника (гейн) относительно текущего состояния.
-3) Дай рекомендации по эквализации по полосам (sub, bass, low-mid, mid, high-mid, air): где приподнять/приглушить и на сколько dB (ориентировочно).
-4) Дай рекомендации по динамике: сколько примерно дБ GR на мастеринговом компрессоре, нужна ли мультибэнд-компрессия, насколько агрессивный лимитер.
-5) Если есть риски перегруза в сабе, грязи в mid, резкости в high-mid — укажи их.
-6) Дай краткий “cheat sheet” — список шагов для мастеринговой цепочки (EQ → Comp → Limiter → Saturation и т.п.).
-7) Пиши в образе Meowsic (кот-саундпродюсер), с лёгким юмором, но профессионально.
+2) Напиши, на сколько dB примерно нужно изменить громкость исходника (гейн).
+3) Дай рекомендации по EQ по полосам (sub, bass, low-mid, mid, high-mid, air).
+4) Дай рекомендации по динамике: компрессия, мультибэнд, лимитер.
+5) Предупреди о рисках (саб, мид, резкость).
+6) Дай короткий cheat sheet цепочки: EQ → Comp → Limiter → Saturation и т.п.
+7) Пиши в образе Meowsic — кот-саундпродюсер.
 """
         try:
             response = client.chat.completions.create(
@@ -398,8 +366,7 @@ async def on_audio_message(message: types.Message):
             await message.answer(answer)
         except Exception as e:
             print("OpenAI error (refmaster):", repr(e))
-            await message.answer("Мяу... не смог согласовать автомастеринг с OpenAI. Попробуй ещё раз позже.")
-
+            await message.answer("Мяу... автомастеринг по цифрам не удался, попробуй ещё раз позже.")
         return
 
 
@@ -472,7 +439,6 @@ async def main():
             )
         except Exception as e:
             print("❌ Ошибка в polling:", repr(e))
-            print("⏳ Перезапуск polling через 5 секунд...")
             await asyncio.sleep(5)
 
 
