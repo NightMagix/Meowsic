@@ -309,9 +309,9 @@ async def cmd_start(message: types.Message):
         "• Общаться в режиме чата.\n\n"
         "Команды выбора модели:\n"
         "• /gpt — чат через ChatGPT\n"
-        "• /gemini — чат через Gemini (models/gemini-2.5-flash)\n\n"
-        "Чат не работает? Пиши разработчику - @nightmagix.\n"
-        "Просто скинь трек или напиши мне что-нибудь."
+        "• /gemini — чат через Gemini\n\n"
+        "Чат не работает? Пиши разработчику - @nightmagix\n"
+        "Для начала просто скинь трек или напиши мне что-нибудь."
     )
     await message.answer(text, reply_markup=main_keyboard)
 
@@ -582,4 +582,5 @@ if __name__ == "__main__":
     web_thread.start()
     time.sleep(1)
     asyncio.run(main())
+
 
