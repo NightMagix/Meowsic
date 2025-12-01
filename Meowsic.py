@@ -3,7 +3,6 @@ import threading
 import asyncio
 import time
 import tempfile
-
 from typing import Dict, Any, Optional
 
 import numpy as np
@@ -17,14 +16,13 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart
 
-# ================= КОНФИГ =================
+# ============== КОНФИГ ==============
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY не найден в переменных окружения")
-
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не найден в переменных окружения")
 
@@ -32,7 +30,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# ================= ЛИЧНОСТЬ МЯУЗИКА =================
+# ============== ЛИЧНОСТЬ МЯУЗИКА ==============
 
 SYSTEM_PROMPT = """
 Ты — Мяузик (Meowsic), уникальный ИИ-кот, эксперт в звуке, миксе, мастеринге и обучении людей звуку.
@@ -46,9 +44,10 @@ SYSTEM_PROMPT = """
 5. В режиме «Автомастеринг под референс» делай подробное ТЗ: что именно нужно сделать с исходным треком, чтобы приблизить его к референсу (по громкости, спектру, динамике).
 """
 
-# ================= ХРАНИЛКА ИСТОРИЙ ДЛЯ ЧАТА =================
+# ============== ИСТОРИИ ЧАТА ==============
 
 user_histories: Dict[int, list] = {}
+
 
 def update_history(uid: int, role: str, content: str):
     if uid not in user_histories:
@@ -58,7 +57,7 @@ def update_history(uid: int, role: str, content: str):
         user_histories[uid] = [user_histories[uid][0]] + user_histories[uid][-10:]
 
 
-# ================= СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЯ =================
+# ============== СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЯ ==============
 
 # mode:
 #   None / "idle" — обычный чат
@@ -68,14 +67,16 @@ def update_history(uid: int, role: str, content: str):
 user_state: Dict[int, Dict[str, Any]] = {}
 ref_sessions: Dict[int, Dict[str, Any]] = {}
 
+
 def set_state(chat_id: int, mode: Optional[str]):
     user_state[chat_id] = {"mode": mode}
+
 
 def get_state(chat_id: int) -> Optional[str]:
     return user_state.get(chat_id, {}).get("mode")
 
 
-# ================= КНОПКИ =================
+# ============== КЛАВИАТУРА ==============
 
 main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
@@ -86,7 +87,7 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# ================= АУДИО-АНАЛИТИКА =================
+# ============== АУДИО-АНАЛИТИКА ==============
 
 def load_audio_mono(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
     y, sr = librosa.load(path, sr=target_sr, mono=True)
@@ -187,7 +188,7 @@ def format_ref_comparison_for_llm(src: Dict[str, Any], ref: Dict[str, Any]) -> s
     return "\n".join(lines)
 
 
-# ================= КОМАНДЫ / КНОПКИ =================
+# ============== КОМАНДЫ / КНОПКИ ==============
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -199,7 +200,7 @@ async def cmd_start(message: types.Message):
         "• общаться как обычный ИИ-кот по звуку и не только;\n"
         "• анализировать твои треки по громкости, динамике и спектру;\n"
         "• делать подробное ТЗ для автомастеринга под референс.\n\n"
-        "Выбери режим на клавиатуре внизу, или просто скинь мне трек — я его сам проанализирую 😺"
+        "Выбери режим на клавиатуре внизу или просто скинь мне трек — я сам его проанализирую 😺"
     )
     await message.answer(text, reply_markup=main_keyboard)
 
@@ -227,7 +228,7 @@ async def on_refmaster_button(message: types.Message):
     )
 
 
-# ================= ЗАГРУЗКА АУДИО =================
+# ============== ЗАГРУЗКА АУДИО ==============
 
 async def download_audio_to_temp(message: types.Message) -> str:
     if message.audio:
@@ -247,13 +248,12 @@ async def download_audio_to_temp(message: types.Message) -> str:
     return tmp_path
 
 
-# Ловим любые аудио/аудио-документы
 @dp.message(F.audio | (F.document & F.document.mime_type.contains("audio")))
 async def on_audio_message(message: types.Message):
     chat_id = message.chat.id
     mode = get_state(chat_id)
 
-    # Если режим не задан, по умолчанию делаем обычный анализ
+    # если режим не задан — считаем, что это просто "Анализ трека"
     effective_mode = mode
     if effective_mode is None or effective_mode == "idle":
         effective_mode = "analysis_wait_track"
@@ -269,7 +269,7 @@ async def on_audio_message(message: types.Message):
         await message.answer("Что-то пошло не так при чтении файла. Попробуй другой формат или файл, мяу.")
         return
 
-    # === Обычный анализ ===
+    # --- простой анализ ---
     if effective_mode == "analysis_wait_track":
         set_state(chat_id, "idle")
         analysis_text = format_analysis_for_llm(analysis)
@@ -296,13 +296,13 @@ async def on_audio_message(message: types.Message):
                 max_tokens=900,
             )
             answer = response.choices[0].message.content
-            await message.answer(answer)
+            await message.answer(answer, reply_markup=main_keyboard)
         except Exception as e:
             print("OpenAI error (analysis):", repr(e))
-            await message.answer("Мяу... не смог договориться с OpenAI. Попробуй ещё раз позже.")
+            await message.answer("Мяу... не смог договориться с OpenAI. Попробуй ещё раз позже.", reply_markup=main_keyboard)
         return
 
-    # === Автомастеринг: сначала исходник ===
+    # --- автомастеринг: сначала исходник ---
     if effective_mode == "refmaster_wait_source":
         ref_sessions[chat_id] = {
             "source_path": tmp_path,
@@ -312,14 +312,18 @@ async def on_audio_message(message: types.Message):
         await message.answer(
             "Я принял твой исходный трек и посмотрел его цифры.\n"
             "Теперь пришли референсный трек (тот, под который хочешь выровнять звук).",
+            reply_markup=main_keyboard,
         )
         return
 
-    # === Автомастеринг: референс ===
+    # --- автомастеринг: референс ---
     if effective_mode == "refmaster_wait_ref":
         session = ref_sessions.get(chat_id)
         if not session:
-            await message.answer("Я потерял контекст. Мяу... Начни заново с «Автомастеринг под референс».")
+            await message.answer(
+                "Я потерял контекст. Мяу... Начни заново с «Автомастеринг под референс».",
+                reply_markup=main_keyboard,
+            )
             set_state(chat_id, "idle")
             return
 
@@ -363,14 +367,17 @@ async def on_audio_message(message: types.Message):
                 max_tokens=1100,
             )
             answer = response.choices[0].message.content
-            await message.answer(answer)
+            await message.answer(answer, reply_markup=main_keyboard)
         except Exception as e:
             print("OpenAI error (refmaster):", repr(e))
-            await message.answer("Мяу... автомастеринг по цифрам не удался, попробуй ещё раз позже.")
+            await message.answer(
+                "Мяу... автомастеринг по цифрам не удался, попробуй ещё раз позже.",
+                reply_markup=main_keyboard,
+            )
         return
 
 
-# ================= ОБЫЧНЫЙ ЧАТ =================
+# ============== ОБЫЧНЫЙ ЧАТ ==============
 
 @dp.message()
 async def generic_chat(message: types.Message):
@@ -380,13 +387,22 @@ async def generic_chat(message: types.Message):
 
     mode = get_state(chat_id)
     if mode == "analysis_wait_track":
-        await message.answer("Мяу, сейчас я жду от тебя аудиофайл для анализа. Пришли трек как аудио или документ.")
+        await message.answer(
+            "Мяу, сейчас я жду от тебя аудиофайл для анализа. Пришли трек как аудио или документ.",
+            reply_markup=main_keyboard,
+        )
         return
     if mode == "refmaster_wait_source":
-        await message.answer("Сначала пришли ИСХОДНЫЙ трек, который нужно подтянуть.")
+        await message.answer(
+            "Сначала пришли ИСХОДНЫЙ трек, который нужно подтянуть.",
+            reply_markup=main_keyboard,
+        )
         return
     if mode == "refmaster_wait_ref":
-        await message.answer("Теперь пришли РЕФЕРЕНСНЫЙ трек (тот, под который выравниваем).")
+        await message.answer(
+            "Теперь пришли РЕФЕРЕНСНЫЙ трек (тот, под который выравниваем).",
+            reply_markup=main_keyboard,
+        )
         return
 
     await bot.send_chat_action(chat_id, "typing")
@@ -401,13 +417,16 @@ async def generic_chat(message: types.Message):
         )
         answer = response.choices[0].message.content
         update_history(uid, "assistant", answer)
-        await message.answer(answer)
+        await message.answer(answer, reply_markup=main_keyboard)
     except Exception as e:
         print("OpenAI error (chat):", repr(e))
-        await message.answer("Мяу... я споткнулся об провод OpenAI. Попробуй ещё раз чуть позже.")
+        await message.answer(
+            "Мяу... я споткнулся об провод OpenAI. Попробуй ещё раз чуть позже.",
+            reply_markup=main_keyboard,
+        )
 
 
-# ================= FLASK ДЛЯ RENDER =================
+# ============== FLASK ДЛЯ RENDER ==============
 
 app = Flask(__name__)
 
@@ -426,7 +445,7 @@ def start_web():
     app.run(host="0.0.0.0", port=port, threaded=True)
 
 
-# ================= MAIN =================
+# ============== MAIN ==============
 
 async def main():
     print("🎧 Meowsic: запускаю aiogram polling...")
@@ -439,6 +458,7 @@ async def main():
             )
         except Exception as e:
             print("❌ Ошибка в polling:", repr(e))
+            print("⏳ Перезапуск polling через 5 секунд...")
             await asyncio.sleep(5)
 
 
