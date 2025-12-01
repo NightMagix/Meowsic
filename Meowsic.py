@@ -347,7 +347,7 @@ async def on_audio_message(message: types.Message):
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages[
+            messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
@@ -489,3 +489,4 @@ if __name__ == "__main__":
     web_thread.start()
     time.sleep(1)
     asyncio.run(main())
+
